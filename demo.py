@@ -60,6 +60,9 @@ def main():
             'oracle': '手写八个页位的五页样例，核对已签存清单的两面和按实物、工位序号关联的 HTTP 原回包',
         }, ensure_ascii=False))
         print(json.dumps({'pending': pending, 'book': readback}, ensure_ascii=False, indent=2))
+        # Mixed-tray back printing shares the same two running endpoints.
+        import mixed_demo
+        mixed_demo.main()
 
 
 if __name__ == '__main__':

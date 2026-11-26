@@ -105,8 +105,10 @@ class PressLine:
     def count(self, role, table):
         tables = {
             'desk': {'drafts', 'editions', 'front_sheets', 'front_receipts', 'loaded_slots',
-                     'tray_orders', 'book_receipts'},
-            'station': {'back_orders', 'back_impressions', 'back_receipts'},
+                     'tray_orders', 'book_receipts', 'mixed_trays', 'mixed_candidates',
+                     'mixed_permits', 'mixed_permit_requests'},
+            'station': {'back_orders', 'back_impressions', 'back_receipts',
+                        'mixed_press_permits', 'mixed_press_outcomes'},
         }
         if table not in tables[role]:
             raise ValueError('unknown test ledger')

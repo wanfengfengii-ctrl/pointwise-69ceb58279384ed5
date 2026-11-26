@@ -2,6 +2,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from front.sheets import read_front_sheet
+from mixed.desk import mixed_tray_exists
 from tray.orientation import FeedDirection, parse_feed_direction
 
 
@@ -64,6 +65,8 @@ def load_slot(db, tray: str, slot: int, sheet: int, direction: FeedDirection) ->
         state = read_tray_state(db, tray)
         if state is not None and state.sealed:
             raise TrayLoadConflict(f'tray {tray} is sealed')
+        if mixed_tray_exists(db, tray):
+            raise TrayLoadConflict(f'tray {tray} is reserved for mixed back printing')
         source = read_front_sheet(db, sheet)
         if state is None:
             db.execute('INSERT INTO trays(name, edition) VALUES (?, ?)', (tray, source.edition))

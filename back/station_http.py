@@ -5,13 +5,15 @@ from back.history import init_back_history, list_order_impressions, read_impress
 from back.intake import init_back_orders, parse_back_order
 from back.printing import BackPrintConflict, print_back
 from back.receipts import init_back_receipts
+from mixed.press import (MixedPressConflict, init_mixed_press, read_mixed_outcome,
+                         record_mixed_outcome, register_mixed_permit)
 from tray.desk_http import (JsonRequestHandler, PeerUnavailable, PrintHTTPServer,
                            get_peer_json, open_database, path_number)
 from tray.orders import TrayOrder
 
 
 class StationRequestHandler(JsonRequestHandler):
-    conflict_errors = (BackPrintConflict,)
+    conflict_errors = (BackPrintConflict, MixedPressConflict)
 
     def _fetch_order(self, order: int) -> TrayOrder:
         data = get_peer_json(self.server.peer, f'/orders/{order}')
@@ -38,6 +40,19 @@ class StationRequestHandler(JsonRequestHandler):
                     db.execute('BEGIN')
                     facts = [fact for order in orders for fact in list_order_impressions(db, order)]
                 return {'impressions': [fact.as_dict() for fact in sorted(facts, key=lambda fact: fact.sequence)]}
+            case 'POST', ['mixed-press', 'permit']:
+                register_mixed_permit(db, data)
+                return {'status': 'registered'}
+            case 'POST', ['mixed-press', 'outcome']:
+                permit = data.get('permit')
+                action = data.get('action')
+                if not isinstance(permit, dict):
+                    raise ValueError('permit must be the original permit object')
+                if action not in ('print', 'unused'):
+                    raise ValueError('action must be print or unused')
+                return record_mixed_outcome(db, permit, action)
+            case 'GET', ['mixed-press', 'outcome', permit] if permit:
+                return read_mixed_outcome(db, permit)
             case _:
                 raise LookupError('unknown station route')
 
@@ -48,6 +63,7 @@ def initialize_station(database) -> None:
         init_back_orders(db)
         init_back_history(db)
         init_back_receipts(db)
+        init_mixed_press(db)
 
 
 def serve_station(database, desk: str, host='127.0.0.1', port=8767) -> PrintHTTPServer:

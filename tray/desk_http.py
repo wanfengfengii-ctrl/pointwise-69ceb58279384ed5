@@ -4,8 +4,8 @@ import sqlite3
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, unquote, urlencode, urlsplit
-from urllib.request import urlopen
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
+from urllib.request import Request, urlopen
 
 from acceptance.evidence import EvidenceUnavailable
 from acceptance.readback import read_book_receipt
@@ -19,6 +19,10 @@ from front.orders import parse_front_order
 from front.printing import FrontPrintConflict, print_front
 from front.receipts import init_front_receipts
 from front.sheets import init_front_sheets, read_front_sheet
+from mixed.desk import (MixedConflict, MixedFinishConflict, PendingIdentification,
+                        correct_mixed_candidates, finish_mixed_book, init_mixed_ledgers,
+                        issue_mixed_permit, mixed_tray_exists, open_mixed_tray,
+                        read_mixed_book_receipt, read_mixed_tray, settle_mixed_permit)
 from tray.loading import TrayLoadConflict, init_trays, load_slot
 from tray.lookup import read_dispatched_order, read_dispatched_tray
 from tray.orders import TrayDispatchConflict, dispatch_tray, init_tray_orders
@@ -57,6 +61,25 @@ def get_peer_json(base: str, path: str) -> dict:
         error.close()
         if error.code == 404:
             raise LookupError('peer has no matching record') from error
+        raise PeerUnavailable(f'peer returned HTTP {error.code}') from error
+    except (URLError, OSError, ValueError, UnicodeError) as error:
+        raise PeerUnavailable('peer response is unavailable') from error
+    if not isinstance(data, dict):
+        raise PeerUnavailable('peer did not return a JSON object')
+    return data
+
+
+def post_peer_json(base: str, path: str, payload: dict) -> dict:
+    if not base:
+        raise PeerUnavailable('peer URL is unavailable')
+    body = json.dumps(payload).encode('utf-8')
+    request = Request(base.rstrip('/') + path, data=body,
+                      headers={'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urlopen(request, timeout=2.0) as response:
+            data = json.load(response)
+    except HTTPError as error:
+        error.close()
         raise PeerUnavailable(f'peer returned HTTP {error.code}') from error
     except (URLError, OSError, ValueError, UnicodeError) as error:
         raise PeerUnavailable('peer response is unavailable') from error
@@ -119,6 +142,11 @@ class JsonRequestHandler(BaseHTTPRequestHandler):
         except FinishConflict as error:
             self._reply(409, {'error': str(error), 'missing': list(error.check.missing),
                               'conflicts': list(error.check.conflicts)})
+        except MixedFinishConflict as error:
+            self._reply(409, {'error': str(error),
+                              'missing_slots': list(error.missing_slots)})
+        except PendingIdentification as error:
+            self._reply(202, error.payload)
         except self.conflict_errors as error:
             self._reply(409, {'error': str(error)})
         except LookupError as error:
@@ -140,7 +168,7 @@ class JsonRequestHandler(BaseHTTPRequestHandler):
 
 
 class DeskRequestHandler(JsonRequestHandler):
-    conflict_errors = (FrontPrintConflict, TrayLoadConflict, TrayDispatchConflict)
+    conflict_errors = (FrontPrintConflict, TrayLoadConflict, TrayDispatchConflict, MixedConflict)
 
     def _fetch_impressions(self, orders: tuple[int, ...]) -> tuple[BackImpression, ...]:
         query = urlencode({'order': orders}, doseq=True)
@@ -149,6 +177,20 @@ class DeskRequestHandler(JsonRequestHandler):
             return tuple(BackImpression.from_dict(item) for item in response['impressions'])
         except (LookupError, PeerUnavailable, TypeError, ValueError) as error:
             raise EvidenceUnavailable('could not obtain station impression evidence') from error
+
+    def _register_mixed_permit(self, permit: dict) -> None:
+        try:
+            post_peer_json(self.server.peer, '/mixed-press/permit', permit)
+        except PeerUnavailable as error:
+            raise EvidenceUnavailable('could not register the mixed permit at the station') from error
+
+    def _fetch_mixed_outcome(self, permit: str) -> dict:
+        try:
+            return get_peer_json(self.server.peer, f'/mixed-press/outcome/{quote(permit, safe="")}')
+        except LookupError:
+            raise
+        except PeerUnavailable as error:
+            raise EvidenceUnavailable('could not obtain the station outcome') from error
 
     def route(self, db, method, parts, query, data) -> dict:
         match method, parts:
@@ -179,9 +221,43 @@ class DeskRequestHandler(JsonRequestHandler):
                 trays = data.get('trays')
                 if not isinstance(trays, list) or not trays or any(not isinstance(tray, str) or not tray for tray in trays):
                     raise ValueError('trays must be a nonempty array of tray names')
-                return finish_book(db, edition, tuple(dict.fromkeys(trays)), self._fetch_impressions).as_dict()
+                names = tuple(dict.fromkeys(trays))
+                mixed_names = tuple(name for name in names if mixed_tray_exists(db, name))
+                if mixed_names:
+                    if len(names) != 1 or len(mixed_names) != 1:
+                        raise MixedConflict('a mixed-tray checkout must name only that mixed tray')
+                    return finish_mixed_book(db, edition, mixed_names[0])
+                return finish_book(db, edition, names, self._fetch_impressions).as_dict()
             case 'GET', ['books', book]:
-                return read_book_receipt(db, path_number(book)).as_dict()
+                book_id = path_number(book)
+                mixed_receipt = read_mixed_book_receipt(db, book_id)
+                if mixed_receipt is not None:
+                    return mixed_receipt
+                return read_book_receipt(db, book_id).as_dict()
+            case 'POST', ['mixed-trays']:
+                tray = data.get('tray')
+                if not isinstance(tray, str) or not tray:
+                    raise ValueError('tray must be a nonempty name')
+                return open_mixed_tray(db, tray, number(data.get('edition'), 'edition'),
+                                       data.get('candidates'))
+            case 'GET', ['mixed-trays', tray] if tray:
+                return read_mixed_tray(db, tray)
+            case 'POST', ['mixed-trays', tray, 'correct'] if tray:
+                return correct_mixed_candidates(db, tray, data.get('base'),
+                                                data.get('slot'), data.get('candidates'))
+            case 'POST', ['mixed-trays', tray, 'permit'] if tray:
+                request = data.get('request')
+                if not isinstance(request, str) or not request:
+                    raise ValueError('request must be a nonempty string')
+                return issue_mixed_permit(db, tray, data.get('slot'), request,
+                                          self._register_mixed_permit)
+            case 'POST', ['mixed-trays', tray, 'settle'] if tray:
+                outcome = data.get('outcome')
+                if not isinstance(outcome, dict) or not isinstance(outcome.get('permit'), str) \
+                        or not outcome['permit']:
+                    raise ValueError('outcome must be the original station outcome object')
+                return settle_mixed_permit(db, outcome['permit'], outcome,
+                                           self._fetch_mixed_outcome)
             case _:
                 raise LookupError('unknown desk route')
 
@@ -196,6 +272,7 @@ def initialize_desk(database) -> None:
         init_trays(db)
         init_tray_orders(db)
         init_book_receipts(db)
+        init_mixed_ledgers(db)
 
 
 def serve_desk(database, station: str, host='127.0.0.1', port=8766) -> PrintHTTPServer:
